@@ -1,0 +1,24 @@
+[project]
+name = "effective-depth"
+version = "1.0.0"
+description = "Code for 'Leveraging the true depth of LLMs'"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "numpy<2.0",
+    "huggingface-hub>=0.26.2",
+    "transformers>=4.46.2",
+    "accelerate>=1.1.1",
+    "tiktoken>=0.8.0",
+    "datasets>=3.1.0",
+    "matplotlib>=3.9.2",
+    "einops>=0.8.0",
+    "torch==2.5.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]  # This tells Hatch to look in the root directory instead of src/
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
