@@ -1,10 +1,9 @@
-from typing import List, Optional, Tuple
-from einops import rearrange
+from typing import List, Optional, Tuple, Callable
 import os
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-import torch.nn.functional as F
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaMLP,
@@ -15,6 +14,7 @@ from transformers.models.llama.modeling_llama import (
     Unpack,
     FlashAttentionKwargs,
     apply_rotary_pos_emb,
+    eager_attention_forward as llama_eager_attention_forward,
 )
 
 
@@ -74,6 +74,8 @@ class TPLlamaAttention(nn.Module):
         super().__init__()
         assert config.hidden_size % config.num_attention_heads == 0
 
+        self.config = config
+
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
 
@@ -89,6 +91,9 @@ class TPLlamaAttention(nn.Module):
         # Split the heads for each GPU
         assert config.num_attention_heads % self.world_size == 0
 
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
         self.n_heads_per_gpu = config.num_attention_heads // self.world_size
         self.n_kv_heads_per_gpu = (
             config.num_attention_heads // (self.world_size * gqa_ratio)
@@ -96,35 +101,36 @@ class TPLlamaAttention(nn.Module):
             else self.n_heads_per_gpu
         )
 
-        self.head_size = getattr(
+        self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
+        self.scaling = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
             config.hidden_size,
-            self.head_size * self.n_heads_per_gpu,
+            self.head_dim * self.n_heads_per_gpu,
             bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
             config.hidden_size,
-            self.head_size * self.n_kv_heads_per_gpu,
+            self.head_dim * self.n_kv_heads_per_gpu,
             bias=config.attention_bias,
         )
         self.v_proj = nn.Linear(
             config.hidden_size,
-            self.head_size * self.n_kv_heads_per_gpu,
+            self.head_dim * self.n_kv_heads_per_gpu,
             bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
-            self.head_size * self.n_heads_per_gpu,
+            self.head_dim * self.n_heads_per_gpu,
             config.hidden_size,
             bias=config.attention_bias,
         )
 
     @torch.no_grad()
     def init_from_layer(self, layer: LlamaAttention) -> None:
-        local_h = self.n_heads_per_gpu * self.head_size
-        local_kv_h = self.n_kv_heads_per_gpu * self.head_size
+        local_h = self.n_heads_per_gpu * self.head_dim
+        local_kv_h = self.n_kv_heads_per_gpu * self.head_dim
         start = self.rank * local_h
         end = (self.rank + 1) * local_h
         start_kv = self.rank * local_kv_h
@@ -148,38 +154,12 @@ class TPLlamaAttention(nn.Module):
         Args:
             * x: (batch_size, seq_len, dim)
         """
-        B, T = hidden_states.shape[0], hidden_states.shape[1]
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        q, k, v = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
-        )  # (B, T, dim // n_ranks)
-
-        q = rearrange(
-            q,
-            "b t (nhg h) -> b nhg t h",
-            b=B,
-            t=T,
-            nhg=self.n_heads_per_gpu,
-            h=self.head_size,
-        )
-        k = rearrange(
-            k,
-            "b t (nhg h) -> b nhg t h",
-            b=B,
-            t=T,
-            nhg=self.n_kv_heads_per_gpu,
-            h=self.head_size,
-        )
-        v = rearrange(
-            v,
-            "b t (nhg h) -> b nhg t h",
-            b=B,
-            t=T,
-            nhg=self.n_kv_heads_per_gpu,
-            h=self.head_size,
-        )
+        q = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -188,19 +168,32 @@ class TPLlamaAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_value.update(k, v, self.layer_idx, cache_kwargs)
 
-        attn_output = F.scaled_dot_product_attention(
+        attention_interface: Callable = llama_eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            if self.config._attn_implementation == "sdpa" and kwargs.get(
+                "output_attentions", False
+            ):
+                print(
+                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                )
+            else:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[
+                    self.config._attn_implementation
+                ]
+
+        attn_output, attn_weights = attention_interface(
+            self,
             q,
             k,
             v,
-            # attn_mask=attention_mask,
-            is_causal=True,
-            dropout_p=0.0 if not self.training else self.attention_dropout,
-            enable_gqa=self.enable_gqa,
-        )  # (B, n_heads, T, h_dim)
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
 
-        attn_output = attn_output.transpose(1, 2).reshape(
-            B, T, -1
-        )  # (B, T, dim // n_ranks)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
         attn_output = self.o_proj(attn_output)  # (B, T, dim)
         dist.all_reduce(attn_output, op=dist.ReduceOp.SUM)
@@ -290,6 +283,7 @@ class TPParallelLlamaAttention(nn.Module):
     ):
         super().__init__()
 
+        self.config = config
         self.num_blocks = num_blocks
         self.n_gpus = dist.get_world_size()
         self.rank = dist.get_rank()
@@ -307,6 +301,7 @@ class TPParallelLlamaAttention(nn.Module):
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
         self.attention_dropout = config.attention_dropout
+        self.scaling = self.head_size**-0.5
 
         # Process group
         self.world_size = dist.get_world_size()
@@ -315,6 +310,9 @@ class TPParallelLlamaAttention(nn.Module):
         # Split the heads for each GPU
         assert config.num_attention_heads % self.world_size == 0
 
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
         self.n_heads_per_gpu = config.num_attention_heads * num_blocks // self.n_gpus
         self.enable_gqa = config.num_attention_heads != config.num_key_value_heads
         gqa_ratio = config.num_attention_heads // config.num_key_value_heads
@@ -385,37 +383,12 @@ class TPParallelLlamaAttention(nn.Module):
             * x: (batch_size, seq_len, dim)
         """
         B, T = hidden_states.shape[0], hidden_states.shape[1]
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_size)
 
-        q, k, v = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
-        )  # (B, T, dim // n_ranks)
-
-        q = rearrange(
-            q,
-            "b t (nhg h) -> b nhg t h",
-            b=B,
-            t=T,
-            nhg=self.n_heads_per_gpu,
-            h=self.head_size,
-        )
-        k = rearrange(
-            k,
-            "b t (nhg h) -> b nhg t h",
-            b=B,
-            t=T,
-            nhg=self.n_kv_heads_per_gpu,
-            h=self.head_size,
-        )
-        v = rearrange(
-            v,
-            "b t (nhg h) -> b nhg t h",
-            b=B,
-            t=T,
-            nhg=self.n_kv_heads_per_gpu,
-            h=self.head_size,
-        )
+        q = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -424,20 +397,33 @@ class TPParallelLlamaAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_value.update(k, v, self.layer_ids[self.b_id], cache_kwargs)
 
-        attn_output = F.scaled_dot_product_attention(
+        attention_interface: Callable = llama_eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            if self.config._attn_implementation == "sdpa" and kwargs.get(
+                "output_attentions", False
+            ):
+                pass
+                # logger.warning_once(
+                #     "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                #     'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                # )
+            else:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[
+                    self.config._attn_implementation
+                ]
+
+        attn_output, _ = attention_interface(
+            self,
             q,
             k,
             v,
-            # attn_mask=attention_mask,
-            is_causal=True,
-            dropout_p=0.0 if not self.training else self.attention_dropout,
-            enable_gqa=self.enable_gqa,
-        )  # (B, n_heads, T, h_dim)
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
 
-        attn_output = attn_output.transpose(1, 2).reshape(
-            B, T, -1
-        )  # (B, T, dim // n_ranks)
-
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)  # (B, T, dim)
 
         # The sum is done over the blocks and over the TP for each block automatically!!
@@ -466,24 +452,7 @@ class TPParallelLlamaDecoderLayer(nn.Module):
         gpus_per_block = dist.get_world_size() // len(layers)
         b_id = dist.get_rank() // gpus_per_block
         self.input_layernorm = layers[b_id].input_layernorm
-
-        # The post-attention layernorm needs to be reduced.
-        # For now we just average TODO investigate
-        self.post_attention_layernorm = LlamaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        # assert len(layers) == 2
-        # reduced_ln_weight = slerp_with_magnitude(
-        #     layers[0].post_attention_layernorm.weight.data,
-        #     layers[1].post_attention_layernorm.weight.data,
-        # )
-        # self.post_attention_layernorm.weight.data = reduced_ln_weight
-        self.post_attention_layernorm.weight.data = sum(
-            layer.post_attention_layernorm.weight.data for layer in layers
-        ) / len(layers)
-        self.post_attention_layernorm.variance_epsilon = min(
-            layer.post_attention_layernorm.variance_epsilon for layer in layers
-        )
+        self.post_attention_layernorm = layers[b_id].post_attention_layernorm
 
     def forward(
         self,

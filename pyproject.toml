@@ -10,6 +10,8 @@ dependencies = [
     "tiktoken>=0.8.0",
     "einops>=0.8.0",
     "torch==2.5.1",
+    "tensorboard>=2.19.0",
+    "tensorflow>=2.19.0",
 ]
 
 [tool.hatch.build.targets.wheel]
